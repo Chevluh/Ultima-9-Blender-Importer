@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Import Ultima 9 models",
     "author": "Chev",
-    "version": (0,1),
+    "version": (0,1,1),
     "blender": (3, 2, 2),
     "location": "File > Import > Ultima 9 models (fixed.*, nonfixed.*, sappear.flx)",
     "description": 'Import models from Ultima Ascension',
@@ -72,10 +72,17 @@ def readVector2(file_object):  #made for ultima UV
     y = readFloat(file_object)
     return Vector([x,y])
 
-def readColor32(file_object):
+def readColor32BGRA(file_object):
     B= readUByte(file_object)/255
     G= readUByte(file_object)/255
     R= readUByte(file_object)/255
+    A= readUByte(file_object)/255
+    return [R,G,B,A]
+
+def readColor32RGBA(file_object):
+    R= readUByte(file_object)/255
+    G= readUByte(file_object)/255
+    B= readUByte(file_object)/255
     A= readUByte(file_object)/255
     return [R,G,B,A]
 
@@ -97,6 +104,25 @@ def readColor16_565(file_object):
     r = ((rawColor >> 11) & 0b11111) / 31 # Shift 10, mask 0x7C00.
 
     a = 1.0
+
+    return [r,g,b,a]
+
+def readColor8_alpha(file_object):
+    b = readUByte(file_object)/255
+    g = readUByte(file_object)/255
+    r = readUByte(file_object)/255
+
+    a = readUByte(file_object)/255
+    a = 1.0
+    return [r,g,b,a]
+
+def readColor8_monochrome(file_object):
+    rawColor = readUByte(file_object)/255
+    b = rawColor
+    g = rawColor
+    r = rawColor
+
+    a = rawColor
 
     return [r,g,b,a]
 
@@ -160,7 +186,16 @@ def readFrameHeader(file_object):
 def modelTextureName(textureIndex, frameIndex):
     return "bitmap16_{0}_{1}".format(textureIndex, frameIndex)
 
-def makeTexture(archiveRecords, textureIndex, frameIndex, textureFile_object):
+# palette = []
+
+# def readPalette(file_object):
+#     #static/ankh.pal is 256 * 4 bytes for the whole palette
+#     #read 4 bytes for each color, rgba but a should be ignored
+#     for i in range(256):
+#         palette.append(readColor8_alpha(file_object))
+#     return None
+
+def makeTexture(archiveRecords, textureIndex, frameIndex, textureFile_object, isAlphaBlended): #, paletteFilePath):
     #print("texture record ({0}_{1}) : ".format(textureIndex, frameIndex), archiveRecords[textureIndex])
     textureFile_object.seek(archiveRecords[textureIndex]["offset"], 0)
     textureSetHeader = readTextureSetHeader(textureFile_object)
@@ -176,8 +211,27 @@ def makeTexture(archiveRecords, textureIndex, frameIndex, textureFile_object):
     #print("unk1: {0:16b} unk2: {1:16b}".format(frameHeader["unknown1"], frameHeader["unknown2"]))
     isTransparent = frameHeader["unknown1"] >> 8 & 1 ==1 #unknown1 bit 13 or unknown2 bit 3 are also possible candidates
     imageData =[]
+    #Determine the bits per pixel by subtracting the frame's size by the total size of the TextureFrameHeader (0x14 + 4 * header.height), 
+    #then dividing by height times width; the result will be 1 or 2
+    #add mipmap sizes too
+    mipSize = frameHeader["width"]*frameHeader["height"]
+    dataSize = mipSize
+    for i in range(textureSetHeader["format"]): #format is actually mip count?
+        mipSize = mipSize/4
+        dataSize += mipSize
+    #if size if all mips assuming 8bpp plus header is equal to record size, texture is indeed 8bpp
+    is8bit = frameRecords[frameIndex]["length"] - (20 + 4 * frameHeader["height"]) == dataSize
+    # if is8bit == True:
+    #     if len(palette) == 0:
+    #         palette_file_object = open(paletteFilePath, "rb")
+    #         readPalette(palette_file_object) #open and pass the file object there
+    #         palette_file_object.close()
     for i in range(frameHeader["width"]*frameHeader["height"]):
-        if isTransparent == False:
+        if is8bit == True: #we assume any 8bit material in texture16 is alpha blended
+            color=readColor8_monochrome(textureFile_object)
+            #color=palette[readUByte(textureFile_object)]
+            #isBlended = True
+        elif isTransparent == False:
             color=readColor16_565(textureFile_object)
         else:
             color=readColor16_5551(textureFile_object)
@@ -189,7 +243,7 @@ def makeTexture(archiveRecords, textureIndex, frameIndex, textureFile_object):
     image.file_format = 'PNG'
     image.pack()
 
-    return isTransparent
+    return isTransparent, is8bit
 
 ###types.dat file
 
@@ -317,7 +371,7 @@ def readNonfixedObject(file_object):
     description["type"] = readUInt16(file_object) # Type index.
     description["rotation"] = (readInt16(file_object), readInt16(file_object), readInt16(file_object), readInt16(file_object)) 
     # Rotation of the entity expressed as an 0.16 quaternion (divide integer values by 32767).
-    description["flags"] = readUInt32(file_object) # Entity flags.
+    description["Flags"] = readUInt32(file_object) # Entity flags.
     description["meshIndex"] = readUInt16(file_object) # The mesh index to render for this entity.
     description["triggerId"] = readUInt16(file_object) #
     description["extraDataOffset"] = readUInt32(file_object) # Offset of the extra data, relative to the end of the file header.
@@ -403,7 +457,7 @@ def readSubmesh(file_object, objectName):
     header["Sorted Faces Offset"] = (readUInt32(file_object),readUInt32(file_object),readUInt32(file_object),readUInt32(file_object)) #Sorted Faces Offset 
     header["unknown4"] = readUInt32(file_object)  # probably unused
 
-    print(header)
+    #print(header)
     
     
     rawFaces = []
@@ -436,19 +490,15 @@ def readSubmesh(file_object, objectName):
 
     # build the blender mesh
     mesh = bpy.data.meshes.new(objectName)
-    # print(vertices)
     mesh.from_pydata(vertices, [], faces) # (x y z) vertices, (1 2) edges, (variable index count) faces 
 
-    new_uv = mesh.uv_layers.new(name = 'DefaultUV')
-    new_colors = mesh.vertex_colors.new(name = 'DefaultColors')
-    loop_normals = [None] * len(mesh.loops)
-
     isInvisible = True
+
     materialIDs = [0] * len(faces)
     for ID, material in enumerate(materials):
-        # print(material)
+        #print(material)
         # create material. the texture will be filled later
-        # special case: if material number is 65535, then ignore curframe, it's an invisible material
+        # special case: if texture  number is 65535, then ignore curframe, it's an invisible material
         frame = material["CurFrame"]
         if material["Texture ID"] == 65535:
             key = "invisible"
@@ -460,20 +510,29 @@ def readSubmesh(file_object, objectName):
                 makeInvisibleMaterial(key)
             else:
                 neededTextures.append((material["Texture ID"], material["CurFrame"]))
-                makeMaterial(key)
+                # if (header["Flags"] >> 10) & 1 == 1 or (header["Flags"] >> 11) & 1 == 1: # waterfalls, clouds
+                #     alphaBlendedTextures.add(material["Texture ID"])
+                # isAdditive = False
+                # if (header["Flags"] >> 11) & 1 == 1: # additive blend?
+                #     additiveMaterials.add(key)
+                #     isAdditive = True
+                makeMaterial(key)#, isAdditive)
         mesh.materials.append(bpy.data.materials[key])
         # assign material to faces
         for face in range(material["Face Count"]):
             materialIDs[material["First Face ID"] + face] = ID
 
+    new_uv = mesh.uv_layers.new(name = 'DefaultUV')
     for loop in mesh.loops:
         new_uv.data[loop.index].uv = UVs[loop.index]
-    for loop in mesh.loops:
-        loop_normals[loop.index] = Vector(normals[loop.index]).normalized()
+    new_colors = mesh.vertex_colors.new(name = 'DefaultColors')
     for loop in mesh.loops:
         new_colors.data[loop.index].color = colors[loop.index]
 
     mesh.use_auto_smooth = True #needed for custom normals
+    loop_normals = [None] * len(mesh.loops)
+    for loop in mesh.loops:
+        loop_normals[loop.index] = Vector(normals[loop.index]).normalized()
     mesh.normals_split_custom_set(loop_normals)
 
     for faceIndex, face in enumerate(mesh.polygons):
@@ -501,7 +560,7 @@ def readFace(file_object):
     # Sometimes a zero-based index into the bitmap16.flx/bitmapC.flx/bitmapsh.flx file (whichever is the active option) 
     # for the texture to use. In other cases this has a pattern but no strict correlation to the material. 
     # Use the material list instead to select textures.
-    face["color"] = readColor32(file_object) # Color of the face in RGBA order, each element being between 0 (black/transparent) and 255 (bright/opaque).
+    face["color"] = readColor32RGBA(file_object) # Color of the face in RGBA order, each element being between 0 (black/transparent) and 255 (bright/opaque).
     face["Collision"] = readUBytes(file_object, 8) # Collision Related, for collision system (index list [so only values from 0, 1, or 2] 
     # that contains the index of the vertex that is closest to each of the faces [order is: left,right,front,back,bottom,top]
     return face
@@ -559,12 +618,13 @@ def readMaterial(file_object):
 def boneName(instanceID, modelID, boneID):
     return "instance {0} mesh {1} bone {2}".format(instanceID, modelID, boneID)
 
-def getMesh(file_object, modelID, archiveRecords, instanceID, only_LOD_0 = False):
+def getMesh(file_object, modelID, archiveRecords, instanceID, typeID, only_LOD_0 = False):
     # TODO: first check if mesh already in blender meshes
-    print("model offset is : ", archiveRecords[modelID]["offset"])
+    #print("model offset is : ", archiveRecords[modelID]["offset"])
+    #print("model ID : ", modelID)
     file_object.seek(archiveRecords[modelID]["offset"])
     header = readModelHeader(file_object)
-    print(header)
+    #print(header)
 
     try:
         # Offsets from the start of the record for each bone followed by (lodcount) submeshes
@@ -583,9 +643,18 @@ def getMesh(file_object, modelID, archiveRecords, instanceID, only_LOD_0 = False
         for offsetDescription in submeshOffsets:
             file_object.seek(archiveRecords[modelID]["offset"] + offsetDescription["header"], 0)
             subMeshHeader = readSubmeshBoneHeader(file_object)
-            print(subMeshHeader)
+            #print(subMeshHeader)
 
             #if header["Submesh Count"] > 1 or header["LOD Count"] > 1: #use empties to organize objects if there's lods or a skeleton
+            #TODO: if single object on a bone (ie no LOD ) and bone is not empty, then directly use mesh instead of bone
+            #however, in truth all bones should be a skeleton instead of empties, then the meshes parented to it
+            #ie makes a first pass that builds the skeleton, then a second that attaches the meshes to it
+            #>>> bpy.context.scene.objects["Cube"].parent
+            #bpy.data.objects['Armature']
+            #>>> bpy.context.scene.objects["Cube"].parent_type
+            #'BONE'
+            #>>> bpy.context.scene.objects["Cube"].parent_bone
+            #'Bone.001'
             name = boneName(instanceID, modelID, subMeshHeader["Limb ID"]);
             bone = bpy.data.objects.new( name, None )
             bpy.context.scene.collection.objects.link(bone)
@@ -604,65 +673,133 @@ def getMesh(file_object, modelID, archiveRecords, instanceID, only_LOD_0 = False
             # else:
             #     bone = None
             for j, LODoffset in enumerate(offsetDescription["lods"]):
-                file_object.seek(archiveRecords[modelID]["offset"] + LODoffset, 0)
-                meshName = "mesh_{0}_{1}_lod_{2}".format(modelID, subMeshHeader["Limb ID"], j)
-                meshObject = readSubmesh(file_object, meshName)
-                if meshObject is not None and bone is not None:
-                    meshObject.parent = bone 
-                if root == None:
-                    root = meshObject
-                # if j > 0: #lod sublevel, hide object
+                if only_LOD_0 == False or (only_LOD_0 == True and j == 0):
+                    file_object.seek(archiveRecords[modelID]["offset"] + LODoffset, 0)
+                    meshName = "mesh_{0}_{1}_lod_{2}".format(modelID, subMeshHeader["Limb ID"], j)
+                    meshObject = readSubmesh(file_object, meshName)
+                    if meshObject is not None and bone is not None:
+                        meshObject.parent = bone 
+                    if root == None:
+                        root = meshObject
+                    # if j > 0: #lod sublevel, hide object
+
     except:
         print("mesh", modelID, "import failed")
         print(header)
         return None
+    newName = root.name.split(' ')
+    newName.insert(2,"type {0}".format(typeID))
+    root.name = ' '.join(newName)
     return root
 
 ########
 
 neededTextures = []
-def makeMaterial(name):
-    mat = bpy.data.materials.new(name)
-    mat.use_nodes = True
-    mat.use_backface_culling = True
-    nodes = mat.node_tree.nodes
+additiveMaterials = set()
+
+def makeMaterial(name, isAdditive = False):
+    material = bpy.data.materials.new(name)
+    material.use_nodes = True
+    material.use_backface_culling = True
+    nodes = material.node_tree.nodes
     mainNode = nodes["Principled BSDF"]
     mainNode.inputs["Specular"].default_value = 0.01
     textureNode=nodes.new("ShaderNodeTexImage")
-    mat.node_tree.links.new(mainNode.inputs["Base Color"], textureNode.outputs["Color"])
-    return mat
+    if isAdditive:
+        transparentNode =nodes.new("ShaderNodeBsdfTransparent")
+        ShaderMixNode =nodes.new("ShaderNodeAddShader")
+        material.node_tree.links.new(ShaderMixNode.inputs[0], transparentNode.outputs[0])
+        material.node_tree.links.new(ShaderMixNode.inputs[1], textureNode.outputs[0])
+        material.node_tree.links.new(nodes['Material Output'].inputs[0], ShaderMixNode.outputs[0])
+        material.blend_method = 'BLEND'
+        material.shadow_method = 'NONE'
+    else:
+        material.node_tree.links.new(mainNode.inputs["Base Color"], textureNode.outputs["Color"])
+    return material
 
-def toTransparentMaterial(material):  # mix with transparent before output
+    #ShaderNodeVertexColor
+    #ShaderNodeMixRGB
+    #ShaderNodeAddShader
+
+additiveBlend = True
+def toTransparentMaterial(material, isAlphaBlended):  # mix with transparent before output
     nodes = material.node_tree.nodes
     mainNode = nodes["Principled BSDF"]
     outputNode = nodes["Material Output"]
     textureNode = nodes["Image Texture"]
 
     transparentNode =nodes.new("ShaderNodeBsdfTransparent")
-    mixNode =nodes.new("ShaderNodeMixShader")
-    
-    material.node_tree.links.new(mixNode.inputs[0], textureNode.outputs[1]) # texture alpha as factor
-    material.node_tree.links.new(mixNode.inputs[1], transparentNode.outputs[0])
-    material.node_tree.links.new(mixNode.inputs[2], mainNode.outputs[0])
-    material.node_tree.links.new(nodes['Material Output'].inputs[0], mixNode.outputs[0])
-    material.blend_method = 'CLIP'
-    material.alpha_threshold = 0.999
-    material.shadow_method = 'CLIP'
+
+    if additiveBlend == True and isAlphaBlended == True:
+        #for additive, use shader add
+        ShaderMixNode =nodes.new("ShaderNodeAddShader")
+        material.node_tree.links.new(ShaderMixNode.inputs[0], transparentNode.outputs[0])
+        #material.node_tree.links.new(ShaderMixNode.inputs[1], mainNode.outputs[0])
+        material.node_tree.links.new(nodes['Material Output'].inputs[0], ShaderMixNode.outputs[0])
+    else:
+        #shadermix is used for alpha clip and non-additive alpha blend
+        ShaderMixNode =nodes.new("ShaderNodeMixShader")
+        material.node_tree.links.new(ShaderMixNode.inputs[0], textureNode.outputs[1]) # texture alpha as factor
+        material.node_tree.links.new(ShaderMixNode.inputs[1], transparentNode.outputs[0])
+        material.node_tree.links.new(ShaderMixNode.inputs[2], mainNode.outputs[0])
+        material.node_tree.links.new(nodes['Material Output'].inputs[0], ShaderMixNode.outputs[0])
+
+    if isAlphaBlended:
+        material.blend_method = 'BLEND'
+        material.shadow_method = 'NONE'
+
+        vertexColorNode = nodes.new("ShaderNodeVertexColor")
+        vertexColorNode.layer_name = 'DefaultColors'
+        colorMixNode = nodes.new("ShaderNodeMixRGB")
+        colorMixNode.blend_type = 'MULTIPLY'
+        colorMixNode.inputs[0].default_value = 1 #factor
+        
+        material.node_tree.links.new(colorMixNode.inputs[1], textureNode.outputs[0]) #color
+        material.node_tree.links.new(colorMixNode.inputs[2], vertexColorNode.outputs[0])
+        if additiveBlend == True:
+            material.node_tree.links.new(ShaderMixNode.inputs[1], colorMixNode.outputs[0])
+        else:
+            material.node_tree.links.new(mainNode.inputs["Base Color"], colorMixNode.outputs[0])
+    else:
+        material.blend_method = 'CLIP'
+        material.alpha_threshold = 0.999
+        material.shadow_method = 'CLIP'
     material.use_backface_culling = False
 
 def makeInvisibleMaterial(name):
-    mat = bpy.data.materials.new(name)
-    mat.use_nodes = True
-    mat.use_backface_culling = True
-    nodes = mat.node_tree.nodes
+    material = bpy.data.materials.new(name)
+    material.use_nodes = True
+    material.use_backface_culling = True
+    nodes = material.node_tree.nodes
     nodes.remove(nodes["Principled BSDF"])
     transparentNode =nodes.new("ShaderNodeBsdfTransparent")
     outputNode = nodes["Material Output"]
-    mat.node_tree.links.new(outputNode.inputs[0], transparentNode.outputs[0])
-    mat.blend_method = 'CLIP'
-    mat.alpha_threshold = 0.5
-    mat.shadow_method = 'NONE'
-    return mat
+    material.node_tree.links.new(outputNode.inputs[0], transparentNode.outputs[0])
+    material.blend_method = 'CLIP'
+    material.alpha_threshold = 0.5
+    material.shadow_method = 'NONE'
+    return material
+
+def makeMaterials(textureFile_object):
+    flxHeader = readArchiveHeader(textureFile_object)
+    # print(flxHeader)
+    archiveRecords = []
+    for i in range(flxHeader["count"]):
+        archiveRecords.append(readArchiveRecord(textureFile_object))
+    # print(archiveRecords)
+
+    for (textureIndex, frameIndex ) in neededTextures:
+        #try:
+            materialName = modelTextureName(textureIndex, frameIndex)
+            isAlphaBlended = False #textureIndex in alphaBlendedTextures
+            isTransparent = False
+            if materialName not in bpy.data.textures:
+                isTransparent, isAlphaBlended = makeTexture(archiveRecords, textureIndex, frameIndex, textureFile_object, isAlphaBlended) #, paletteFilePath)
+            bpy.data.materials[materialName].node_tree.nodes["Image Texture"].image = bpy.data.images[materialName]
+            if isTransparent == True:
+                toTransparentMaterial(bpy.data.materials[materialName], isAlphaBlended)
+        #except:
+        #  print("An exception occurred with texture ", (textureIndex, frameIndex ))
 
 def GetNonfixedObjectList(file_object):
     header = readNonfixedHeader(file_object)
@@ -670,7 +807,7 @@ def GetNonfixedObjectList(file_object):
     pageCount = header["width"] * header["height"]
 
 
-    # fixed objects
+    # nonfixed objects
     nonfixedObjects = []
     headerEnd = file_object.tell()
     for i in range(pageCount):
@@ -683,8 +820,9 @@ def GetNonfixedObjectList(file_object):
             for j in range(pageHeader["entityCount"]): # always 166 entries
                 # read object ref
                 nonfixedObject = readNonfixedObject(file_object)
-                print("offset : ", file_object.tell())
-                print(nonfixedObject)
+                #print("offset : ", file_object.tell())
+                #print(i)
+                #print(nonfixedObject)
                 if nonfixedObject["type"] !=0: #type 0 entries are just empty
                     nonfixedObject["worldPosition"] = (pageHeader["baseX"]/scaleFactor +nonfixedObject["position"][0]/scaleFactor, 
                         pageHeader["baseY"]/scaleFactor +nonfixedObject["position"][1]/scaleFactor, nonfixedObject["position"][2]/scaleFactor)
@@ -696,6 +834,20 @@ def GetNonfixedObjectList(file_object):
         except:
             print("stopped at page ", i)
             break
+    #raise Exception("done with nonfixed objects")
+    for index, nonfixedObject in enumerate(nonfixedObjects):
+        if nonfixedObject["extraDataOffset"]!=0:
+            file_object.seek(nonfixedObject["extraDataOffset"])
+            argCount = readUByte(file_object)
+            data = []
+            print("instance", index)
+            for i in range(argCount):
+                entry = dict()
+                entry["types"] = (readUByte(file_object), readUByte(file_object), readUByte(file_object))
+                entry["arguments"] = (readUInt32(file_object), readUInt32(file_object), readUInt32(file_object))
+                print(entry)
+
+
     
     # to scan the file for page candidates
     # while True:
@@ -711,9 +863,9 @@ def GetNonfixedObjectList(file_object):
 
 def GetFixedObjectList(file_object):
     header = readHeader(file_object)
-    print(header)
+    #print(header)
     pageCount = header["width"] * header["height"]
-    print("pageCount : ", pageCount)
+    #print("pageCount : ", pageCount)
     indices = [] # These are either 0 or a number in the form nnnn001h, where nnnn is a number that may be a page index
     for i in range(pageCount):
         indices.append(readUInt32(file_object)) 
@@ -722,12 +874,12 @@ def GetFixedObjectList(file_object):
     for i in range(pageCount):
         try:
             pageHeader = readPageHeader(file_object)
-            print("page ", i)
-            print(pageHeader)
+            #print("page ", i)
+            #print(pageHeader)
             for j in range(166): #always 166 entries
                 #read object ref
                 fixedObject = readFixedObject(file_object)
-                print(fixedObject)
+                #print(fixedObject)
                 if fixedObject["type"] !=0: # type 0 entries are just empty
                     fixedObject["worldPosition"] = (pageHeader["baseX"]/scaleFactor +fixedObject["position"][0]/scaleFactor, 
                         pageHeader["baseY"]/scaleFactor +fixedObject["position"][1]/scaleFactor, fixedObject["position"][2]/scaleFactor)
@@ -741,12 +893,14 @@ def GetFixedObjectList(file_object):
             break
     return fixedObjects
 
-def ImportMapModels(mapObjectFilePath, textureFilePath, typesFilePath, modelsFilePath):
+def ImportMapModels(mapObjectFilePath, textureFilePath, typesFilePath, modelsFilePath, paletteFilePath):
     file_object = open(mapObjectFilePath, "rb")
     if "runtime" in mapObjectFilePath:
+        print("Nonfixed objects")
         mapObjects = GetNonfixedObjectList(file_object)
     #
     else:
+        print("Fixed objects")
         mapObjects = GetFixedObjectList(file_object)
     file_object.close()
 
@@ -761,7 +915,7 @@ def ImportMapModels(mapObjectFilePath, textureFilePath, typesFilePath, modelsFil
     modelsFile_object = open(modelsFilePath, "rb")
     # get flx header
     flxHeader = readArchiveHeader(modelsFile_object)
-    print(flxHeader)
+    #print(flxHeader)
     archiveRecords = []
     for i in range(flxHeader["count"]):
         archiveRecords.append(readArchiveRecord(modelsFile_object))
@@ -780,8 +934,8 @@ def ImportMapModels(mapObjectFilePath, textureFilePath, typesFilePath, modelsFil
         except:
             modelID = 0
         if modelID != 0: #ID 0 is also debug cube
-            print("modelID : ", modelID)
-            meshObject = getMesh(modelsFile_object, modelID, archiveRecords, i)
+            #print("modelID : ", modelID)
+            meshObject = getMesh(modelsFile_object, modelID, archiveRecords, i, instance["type"], only_LOD_0 = True)
             if meshObject is not None:
                 meshObject.location = instance["worldPosition"]
                 
@@ -789,33 +943,19 @@ def ImportMapModels(mapObjectFilePath, textureFilePath, typesFilePath, modelsFil
                 
                 meshObject.rotation_quaternion = Quaternion((instance["orientation"][3], instance["orientation"][0], 
                     instance["orientation"][1],instance["orientation"][2]))
+            if instance["Flags"] >> 12 == 1:
+                print("Instance {0} flags : {1:#018b}".format(i, instance["Flags"]))
     modelsFile_object.close()
 
     textureFile_object = open(textureFilePath, "rb")
-    flxHeader = readArchiveHeader(textureFile_object)
-    # print(flxHeader)
-    archiveRecords = []
-    for i in range(flxHeader["count"]):
-        archiveRecords.append(readArchiveRecord(textureFile_object))
-    # print(archiveRecords)
+    makeMaterials(textureFile_object)
+    textureFile_object.close()
 
-    for (textureIndex, frameIndex ) in neededTextures:
-        try:
-            materialName = modelTextureName(textureIndex, frameIndex)
-            isTransparent = False
-            if materialName not in bpy.data.textures:
-                isTransparent = makeTexture(archiveRecords, textureIndex, frameIndex, textureFile_object)
-            bpy.data.materials[materialName].node_tree.nodes["Image Texture"].image = bpy.data.images[materialName]
-            if isTransparent == True:
-                toTransparentMaterial(bpy.data.materials[materialName])
-        except:
-          print("An exception occurred with texture ", (textureIndex, frameIndex ))
-
-def ImportSingleModel(modelID, textureFilePath, modelsFilePath, modelCount):
+def ImportSingleModel(modelID, textureFilePath, modelsFilePath, paletteFilePath, modelCount):
     modelsFile_object = open(modelsFilePath, "rb")
     # get flx header
     flxHeader = readArchiveHeader(modelsFile_object)
-    print(flxHeader)
+    #print(flxHeader)
     archiveRecords = []
     for i in range(flxHeader["count"]):
         archiveRecords.append(readArchiveRecord(modelsFile_object))
@@ -824,32 +964,16 @@ def ImportSingleModel(modelID, textureFilePath, modelsFilePath, modelCount):
     rowCount = math.ceil(math.sqrt(modelCount))
     for i in range(modelCount):
         if modelID + modelCount -1 <= 3764: #mesh 536 crashes
-            meshObject = getMesh(modelsFile_object, modelID + i, archiveRecords, i, only_LOD_0 = True)
+            meshObject = getMesh(modelsFile_object, modelID + i, archiveRecords, i, None, only_LOD_0 = True)
             if meshObject is not None:
                 meshObject.location = meshObject.location + Vector(((i % rowCount) * 3, (i // rowCount) * 3, 0))
 
     modelsFile_object.close()
 
     textureFile_object = open(textureFilePath, "rb")
-    flxHeader = readArchiveHeader(textureFile_object)
-    # print(flxHeader)
-    archiveRecords = []
-    for i in range(flxHeader["count"]):
-        archiveRecords.append(readArchiveRecord(textureFile_object))
-    # print(archiveRecords)
-
-    for (textureIndex, frameIndex ) in neededTextures:
-        try:
-            materialName = modelTextureName(textureIndex, frameIndex)
-            isTransparent = False
-            if materialName not in bpy.data.textures:
-                isTransparent = makeTexture(archiveRecords, textureIndex, frameIndex, textureFile_object)
-            bpy.data.materials[materialName].node_tree.nodes["Image Texture"].image = bpy.data.images[materialName]
-            if isTransparent == True:
-                toTransparentMaterial(bpy.data.materials[materialName])
-        except:
-          print("An exception occurred with texture ", (textureIndex, frameIndex ))
-        
+    makeMaterials(textureFile_object)
+    textureFile_object.close()
+       
 ###
 
 class MyDialog(bpy.types.Operator):
@@ -861,6 +985,7 @@ class MyDialog(bpy.types.Operator):
     textureFilePath: bpy.props.StringProperty(name="textureFilePath", options={'HIDDEN'})
     typesFilePath: bpy.props.StringProperty(name="typesFilePath", options={'HIDDEN'})
     meshFilePath: bpy.props.StringProperty(name="meshFilePath", options={'HIDDEN'})
+    paletteFilePath: bpy.props.StringProperty(name="paletteFilePath", options={'HIDDEN'})
 
     modelID: bpy.props.IntProperty(name="Model ID", max=3764, min=0)
     modelCount: bpy.props.IntProperty(name="Range", max=3765, min=1, default = 1)
@@ -870,7 +995,7 @@ class MyDialog(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def execute(self, context):
-        ImportSingleModel(self.modelID, self.textureFilePath, self.meshFilePath, self.modelCount)
+        ImportSingleModel(self.modelID, self.textureFilePath, self.meshFilePath, self.paletteFilePath, self.modelCount)
         return {'FINISHED'}
 
     # def draw(self, context):
@@ -898,6 +1023,7 @@ class ImportUltimaFixed(bpy.types.Operator, ImportHelper):
         textureFilePath = os.path.join(os.path.dirname(modelFilePath), "..\\static\\bitmap16.flx")
         typesFilePath = os.path.join(os.path.dirname(modelFilePath), "..\\static\\types.dat")
         meshFilePath = os.path.join(os.path.dirname(modelFilePath), "..\\static\\sappear.flx")
+        paletteFilePath = os.path.join(os.path.dirname(modelFilePath), "..\\static\\ankh.pal")
 
         print("importing {0}".format(modelFilePath))
         print ("textureFilePath : ", textureFilePath)
@@ -906,9 +1032,9 @@ class ImportUltimaFixed(bpy.types.Operator, ImportHelper):
 
         if os.path.basename(modelFilePath) == "sappear.flx":
             bpy.ops.tools.mydialog('INVOKE_DEFAULT', 
-                textureFilePath = textureFilePath, typesFilePath = typesFilePath, meshFilePath = meshFilePath)
+                textureFilePath = textureFilePath, typesFilePath = typesFilePath, meshFilePath = meshFilePath, paletteFilePath = paletteFilePath)
         else:
-            ImportMapModels(modelFilePath, textureFilePath, typesFilePath, meshFilePath) #ntpath.basename(modelFilePath[:-4]))
+            ImportMapModels(modelFilePath, textureFilePath, typesFilePath, meshFilePath, paletteFilePath) #ntpath.basename(modelFilePath[:-4]))
 
         now = time.time()
         print("It took: {0} seconds".format(now-then))
